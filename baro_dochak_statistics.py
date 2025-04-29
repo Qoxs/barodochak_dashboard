@@ -1,5 +1,6 @@
 import pandas as pd
 import os
+import plotly.express as px
 
 # 현재 스크립트의 디렉토리 경로를 가져옴
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -82,3 +83,25 @@ result['over_30min_ratio'] = (result['over_30min_orders'] / result['total_orders
 # 결과 확인
 print("시간대별 통계 (lunch & dinner):")
 print(result)
+
+# 그래프용 데이터 복사
+graph_data = result.copy()
+
+# 날짜 컬럼을 datetime 타입으로 변환
+graph_data['datetime_simple'] = pd.to_datetime(graph_data['datetime_simple'])
+
+# 날짜 기준으로 정렬
+graph_data = graph_data.sort_values('datetime_simple')
+
+graph_data['avg_delivery_time'] = graph_data['avg_delivery_minutes'].apply(lambda x: f"{int(x)}분 {int((x - int(x)) * 60)}초")
+
+fig_time = px.line(
+    graph_data,
+    x='datetime_simple',
+    y='avg_delivery_minutes',
+    color='time_period',
+    title='시간대별 평균 배달 시간 추이',
+    labels={'datetime_simple': '날짜', 'avg_delivery_minutes': '평균 배달 시간', 'time_period': '시간대'},
+    custom_data=['avg_delivery_time']
+)
+fig_time.update_xaxes(dtick="D", tickformat="%Y-%m-%d")  # x축을 날짜로 명확히 표시
