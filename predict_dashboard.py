@@ -46,32 +46,42 @@ if df is None:
     st.stop()
 
 df['datetime_simple'] = pd.to_datetime(df['datetime_simple'])
+df['weekday_type'] = df['datetime_simple'].dt.weekday.apply(lambda x: '주말' if x >= 5 else '평일')
 
 # 필터 UI
 hname_options = df['order_hname'].unique().tolist()
 menu_options = df['menu_name'].unique().tolist()
 time_options = df['time_period'].unique().tolist()
+weekday_options = ['전체', '평일', '주말']
 min_date = df['datetime_simple'].min().date()
 max_date = df['datetime_simple'].max().date()
 
-col1, col2, col3 = st.columns(3)
+col1, col2, col3, col4 = st.columns(4)
 with col1:
     selected_hname = st.multiselect("행정동", hname_options, default=hname_options)
 with col2:
     selected_menu = st.multiselect("메뉴명", menu_options, default=menu_options)
 with col3:
     selected_time = st.multiselect("시간대", time_options, default=time_options)
+with col4:
+    selected_weekday = st.multiselect("요일구분", weekday_options, default=['전체'])
 
 start_date, end_date = st.date_input("날짜 범위", value=(min_date, max_date), min_value=min_date, max_value=max_date)
 
-# 필터 적용
+# 평일/주말 필터 적용
+if '전체' in selected_weekday or not selected_weekday:
+    weekday_mask = df['weekday_type'].isin(['평일', '주말'])
+else:
+    weekday_mask = df['weekday_type'].isin(selected_weekday)
+
 filtered = df[
     (df['order_hname'].isin(selected_hname)) &
     (df['menu_name'].isin(selected_menu)) &
     (df['time_period'].isin(selected_time)) &
     (df['datetime_simple'] >= pd.to_datetime(start_date)) &
     (df['datetime_simple'] <= pd.to_datetime(end_date)) &
-    (df['event_type'] == '주문 접수')
+    (df['event_type'] == '주문 접수') &
+    (weekday_mask)
 ]
 
 # 집계: 동/메뉴/시간대/날짜별 주문수
@@ -80,6 +90,53 @@ agg = (
     .size()
     .reset_index(name='order_count')
 )
+
+# --- 모든 동+모든 메뉴 합산 (최상단에 배치) ---
+st.markdown("### [모든 동+메뉴 합산] 전체 주문수 예측 (이동평균 회귀)")
+for tp in selected_time:
+    sub = agg[
+        (agg['time_period'] == tp)
+    ].groupby('datetime_simple')['order_count'].sum().reset_index()
+    if len(sub) < 8:
+        continue
+    # 주문수가 0인 row 제거
+    sub = sub[sub['order_count'] > 0]
+    # 이동평균 계산
+    sub['ma3'] = sub['order_count'].rolling(window=3, min_periods=1).mean().shift(1)
+    sub['ma7'] = sub['order_count'].rolling(window=7, min_periods=1).mean().shift(1)
+    sub = sub.dropna(subset=['ma3', 'ma7'])
+    # 모델 학습
+    X = sub[['ma3', 'ma7']].values
+    y = sub['order_count'].values
+    model = LinearRegression().fit(X, y)
+    y_pred = model.predict(X)
+    r2 = model.score(X, y)
+    # 다음날 예측 (전날까지의 평균, 0 제외)
+    if len(sub) > 3:
+        ma3 = sub['order_count'].iloc[-3:].mean()
+    else:
+        ma3 = sub['order_count'].mean()
+    if len(sub) > 7:
+        ma7 = sub['order_count'].iloc[-7:].mean()
+    else:
+        ma7 = sub['order_count'].mean()
+    next_pred = model.predict(np.array([[ma3, ma7]]))[0]
+    next_day = sub['datetime_simple'].max() + pd.Timedelta(days=1)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=sub['datetime_simple'], y=y, mode='lines+markers', name='실제 주문수'))
+    fig.add_trace(go.Scatter(x=sub['datetime_simple'], y=y_pred, mode='lines+markers', name='예측 주문수'))
+    # 다음날 예측값 추가
+    fig.add_trace(go.Scatter(
+        x=[next_day], y=[next_pred],
+        mode='markers+text', name='다음날 예측',
+        marker=dict(color='red', size=12),
+        text=[f"{next_pred:.1f}"], textposition="top center"
+    ))
+    fig.update_layout(title=f"[모든 동+메뉴 합산] {tp} 전체 주문수 예측", xaxis_title="날짜", yaxis_title="주문수")
+    st.plotly_chart(fig, use_container_width=True)
+    st.write(f"**회귀식:** 주문수 = {model.coef_[0]:.3f} × 3일이동평균 + {model.coef_[1]:.3f} × 7일이동평균 + {model.intercept_:.3f}")
+    st.write(f"**설명력(R²):** {r2:.3f}")
+    st.info(f"**{next_day.date()} 예측 주문수: {next_pred:.2f}**")
 
 # --- 모든 동 합산: 각 메뉴별 ---
 st.markdown("### [모든 동 합산] 메뉴별 주문수 예측 (이동평균 회귀)")
@@ -91,19 +148,30 @@ for menu in selected_menu:
         ].groupby('datetime_simple')['order_count'].sum().reset_index()
         if len(sub) < 8:
             continue
-        sub = sub.set_index('datetime_simple').asfreq('D', fill_value=0).reset_index()
-        sub['ma3'] = sub['order_count'].rolling(window=3, min_periods=1).mean()
-        sub['ma7'] = sub['order_count'].rolling(window=7, min_periods=1).mean()
+        # 주문수가 0인 row 제거
+        sub = sub[sub['order_count'] > 0]
+
+        # 이동평균 계산
+        sub['ma3'] = sub['order_count'].rolling(window=3, min_periods=1).mean().shift(1)
+        sub['ma7'] = sub['order_count'].rolling(window=7, min_periods=1).mean().shift(1)
+        sub = sub.dropna(subset=['ma3', 'ma7'])
+
+        # 모델 학습
         X = sub[['ma3', 'ma7']].values
         y = sub['order_count'].values
         model = LinearRegression().fit(X, y)
         y_pred = model.predict(X)
         r2 = model.score(X, y)
 
-        # 다음날 예측
-        next_day = sub['datetime_simple'].max() + pd.Timedelta(days=1)
-        ma3 = sub['order_count'].iloc[-3:].mean()
-        ma7 = sub['order_count'].iloc[-7:].mean()
+        # 다음날 예측 (전날까지의 평균, 0 제외)
+        if len(sub) > 3:
+            ma3 = sub['order_count'].iloc[-3:].mean()
+        else:
+            ma3 = sub['order_count'].mean()
+        if len(sub) > 7:
+            ma7 = sub['order_count'].iloc[-7:].mean()
+        else:
+            ma7 = sub['order_count'].mean()
         next_pred = model.predict(np.array([[ma3, ma7]]))[0]
 
         fig = go.Figure()
@@ -111,7 +179,7 @@ for menu in selected_menu:
         fig.add_trace(go.Scatter(x=sub['datetime_simple'], y=y_pred, mode='lines+markers', name='예측 주문수'))
         # 다음날 예측값 추가
         fig.add_trace(go.Scatter(
-            x=[next_day], y=[next_pred],
+            x=[sub['datetime_simple'].max() + pd.Timedelta(days=1)], y=[next_pred],
             mode='markers+text', name='다음날 예측',
             marker=dict(color='red', size=12),
             text=[f"{next_pred:.1f}"], textposition="top center"
@@ -120,28 +188,4 @@ for menu in selected_menu:
         st.plotly_chart(fig, use_container_width=True)
         st.write(f"**회귀식:** 주문수 = {model.coef_[0]:.3f} × 3일이동평균 + {model.coef_[1]:.3f} × 7일이동평균 + {model.intercept_:.3f}")
         st.write(f"**설명력(R²):** {r2:.3f}")
-        st.info(f"**{next_day.date()} 예측 주문수: {next_pred:.2f}**")
-
-# --- 모든 동+모든 메뉴 합산 ---
-st.markdown("### [모든 동+메뉴 합산] 전체 주문수 예측 (이동평균 회귀)")
-for tp in selected_time:
-    sub = agg[
-        (agg['time_period'] == tp)
-    ].groupby('datetime_simple')['order_count'].sum().reset_index()
-    if len(sub) < 8:
-        continue
-    sub = sub.set_index('datetime_simple').asfreq('D', fill_value=0).reset_index()
-    sub['ma3'] = sub['order_count'].rolling(window=3, min_periods=1).mean()
-    sub['ma7'] = sub['order_count'].rolling(window=7, min_periods=1).mean()
-    X = sub[['ma3', 'ma7']].values
-    y = sub['order_count'].values
-    model = LinearRegression().fit(X, y)
-    y_pred = model.predict(X)
-    r2 = model.score(X, y)
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=sub['datetime_simple'], y=y, mode='lines+markers', name='실제 주문수'))
-    fig.add_trace(go.Scatter(x=sub['datetime_simple'], y=y_pred, mode='lines+markers', name='예측 주문수'))
-    fig.update_layout(title=f"[모든 동+메뉴 합산] {tp} 전체 주문수 예측", xaxis_title="날짜", yaxis_title="주문수")
-    st.plotly_chart(fig, use_container_width=True)
-    st.write(f"**회귀식:** 주문수 = {model.coef_[0]:.3f} × 3일이동평균 + {model.coef_[1]:.3f} × 7일이동평균 + {model.intercept_:.3f}")
-    st.write(f"**설명력(R²):** {r2:.3f}")
+        st.info(f"**{sub['datetime_simple'].max().date() + pd.Timedelta(days=1)} 예측 주문수: {next_pred:.2f}**")
