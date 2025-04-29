@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import os
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
+from google.oauth2 import service_account
 
 # 분:초 형식으로 변환하는 함수
 def format_minutes_seconds(minutes):
@@ -16,16 +17,14 @@ def format_minutes_seconds(minutes):
 
 # Google Sheets API 설정
 def get_google_sheets_data():
-    # 서비스 계정 키 파일 경로
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    SERVICE_ACCOUNT_FILE = os.path.join(current_dir, 'baro-dochack-dashboard-d7d1b43e20c8.json')
-    
     # 접근 권한 범위
     SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
     
-    # 인증 객체 생성
-    creds = Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+    # Streamlit Secrets에서 서비스 계정 정보 가져오기
+    creds = service_account.Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"],
+        scopes=SCOPES
+    )
     
     # Sheets API 클라이언트 생성
     service = build('sheets', 'v4', credentials=creds)
