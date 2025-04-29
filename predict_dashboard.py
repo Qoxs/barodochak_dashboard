@@ -3,16 +3,48 @@ import pandas as pd
 import numpy as np
 from sklearn.linear_model import LinearRegression
 import plotly.graph_objects as go
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 
 # 데이터 불러오기 함수 (기존 get_google_sheets_data 재활용)
 def get_google_sheets_data():
-    # ... (생략, 기존과 동일) ...
+    SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
+    creds = service_account.Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"],
+        scopes=SCOPES
+    )
+    service = build('sheets', 'v4', credentials=creds)
+    SPREADSHEET_ID = '18r37Qff2igl38HkUEVefFtmT1iOpJ-jIg5aQ91wIUII'
+    RANGE_NAME = 'event_raw!A1:Z30000'
+    result = service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID, range=RANGE_NAME).execute()
+    values = result.get('values', [])
+    if not values:
+        st.error('데이터를 찾을 수 없습니다.')
+        return None
+    df = pd.DataFrame(values[1:], columns=values[0])
+    # datetime 컬럼이 있다면 time_period 컬럼 추가
+    if 'datetime' in df.columns:
+        df['datetime'] = pd.to_datetime(df['datetime'])
+        def get_time_period(hour):
+            if 10 <= hour < 15:
+                return 'lunch'
+            elif 17 <= hour < 22:
+                return 'dinner'
+            else:
+                return 'other'
+        df['time_period'] = df['datetime'].dt.hour.apply(get_time_period)
+        df = df[df['time_period'] != 'other']
     return df
 
 st.set_page_config(page_title="주문수 예측 대시보드", layout="wide")
 st.title("주문수 예측: 이동평균 기반 선형회귀")
 
 df = get_google_sheets_data()
+if df is None:
+    st.error("구글 시트에서 데이터를 불러오지 못했습니다.")
+    st.stop()
+
 df['datetime_simple'] = pd.to_datetime(df['datetime_simple'])
 
 # 필터 UI
@@ -49,42 +81,67 @@ agg = (
     .reset_index(name='order_count')
 )
 
-# 각 조합별로 모델링
-for hname in selected_hname:
-    for menu in selected_menu:
-        for tp in selected_time:
-            sub = agg[
-                (agg['order_hname'] == hname) &
-                (agg['menu_name'] == menu) &
-                (agg['time_period'] == tp)
-            ].sort_values('datetime_simple')
-            if len(sub) < 8:
-                continue  # 데이터가 너무 적으면 스킵
+# --- 모든 동 합산: 각 메뉴별 ---
+st.markdown("### [모든 동 합산] 메뉴별 주문수 예측 (이동평균 회귀)")
+for menu in selected_menu:
+    for tp in selected_time:
+        sub = agg[
+            (agg['menu_name'] == menu) &
+            (agg['time_period'] == tp)
+        ].groupby('datetime_simple')['order_count'].sum().reset_index()
+        if len(sub) < 8:
+            continue
+        sub = sub.set_index('datetime_simple').asfreq('D', fill_value=0).reset_index()
+        sub['ma3'] = sub['order_count'].rolling(window=3, min_periods=1).mean()
+        sub['ma7'] = sub['order_count'].rolling(window=7, min_periods=1).mean()
+        X = sub[['ma3', 'ma7']].values
+        y = sub['order_count'].values
+        model = LinearRegression().fit(X, y)
+        y_pred = model.predict(X)
+        r2 = model.score(X, y)
 
-            sub = sub.set_index('datetime_simple').asfreq('D', fill_value=0).reset_index()
-            sub['ma3'] = sub['order_count'].rolling(window=3, min_periods=1).mean()
-            sub['ma7'] = sub['order_count'].rolling(window=7, min_periods=1).mean()
+        # 다음날 예측
+        next_day = sub['datetime_simple'].max() + pd.Timedelta(days=1)
+        ma3 = sub['order_count'].iloc[-3:].mean()
+        ma7 = sub['order_count'].iloc[-7:].mean()
+        next_pred = model.predict(np.array([[ma3, ma7]]))[0]
 
-            # 오늘 이후 데이터는 예측용으로 분리 가능 (여기선 전체 fit)
-            X = sub[['ma3', 'ma7']].values
-            y = sub['order_count'].values
-            model = LinearRegression().fit(X, y)
-            y_pred = model.predict(X)
-            r2 = model.score(X, y)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=sub['datetime_simple'], y=y, mode='lines+markers', name='실제 주문수'))
+        fig.add_trace(go.Scatter(x=sub['datetime_simple'], y=y_pred, mode='lines+markers', name='예측 주문수'))
+        # 다음날 예측값 추가
+        fig.add_trace(go.Scatter(
+            x=[next_day], y=[next_pred],
+            mode='markers+text', name='다음날 예측',
+            marker=dict(color='red', size=12),
+            text=[f"{next_pred:.1f}"], textposition="top center"
+        ))
+        fig.update_layout(title=f"[모든 동 합산] {menu} - {tp} 주문수 예측", xaxis_title="날짜", yaxis_title="주문수")
+        st.plotly_chart(fig, use_container_width=True)
+        st.write(f"**회귀식:** 주문수 = {model.coef_[0]:.3f} × 3일이동평균 + {model.coef_[1]:.3f} × 7일이동평균 + {model.intercept_:.3f}")
+        st.write(f"**설명력(R²):** {r2:.3f}")
+        st.info(f"**{next_day.date()} 예측 주문수: {next_pred:.2f}**")
 
-            # 시각화
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=sub['datetime_simple'], y=y, mode='lines+markers', name='실제 주문수'))
-            fig.add_trace(go.Scatter(x=sub['datetime_simple'], y=y_pred, mode='lines+markers', name='예측 주문수'))
-            fig.update_layout(title=f"{hname} - {menu} - {tp} 주문수 예측 (이동평균 회귀)", xaxis_title="날짜", yaxis_title="주문수")
-            st.plotly_chart(fig, use_container_width=True)
-
-            # 잔차 플롯
-            fig2 = go.Figure()
-            fig2.add_trace(go.Bar(x=sub['datetime_simple'], y=(y - y_pred), name='잔차(오차)'))
-            fig2.update_layout(title="잔차(실제-예측)", xaxis_title="날짜", yaxis_title="오차")
-            st.plotly_chart(fig2, use_container_width=True)
-
-            # 모델 계수 및 R2
-            st.write(f"**회귀식:** 주문수 = {model.coef_[0]:.3f} × 3일이동평균 + {model.coef_[1]:.3f} × 7일이동평균 + {model.intercept_:.3f}")
-            st.write(f"**설명력(R²):** {r2:.3f}")
+# --- 모든 동+모든 메뉴 합산 ---
+st.markdown("### [모든 동+메뉴 합산] 전체 주문수 예측 (이동평균 회귀)")
+for tp in selected_time:
+    sub = agg[
+        (agg['time_period'] == tp)
+    ].groupby('datetime_simple')['order_count'].sum().reset_index()
+    if len(sub) < 8:
+        continue
+    sub = sub.set_index('datetime_simple').asfreq('D', fill_value=0).reset_index()
+    sub['ma3'] = sub['order_count'].rolling(window=3, min_periods=1).mean()
+    sub['ma7'] = sub['order_count'].rolling(window=7, min_periods=1).mean()
+    X = sub[['ma3', 'ma7']].values
+    y = sub['order_count'].values
+    model = LinearRegression().fit(X, y)
+    y_pred = model.predict(X)
+    r2 = model.score(X, y)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=sub['datetime_simple'], y=y, mode='lines+markers', name='실제 주문수'))
+    fig.add_trace(go.Scatter(x=sub['datetime_simple'], y=y_pred, mode='lines+markers', name='예측 주문수'))
+    fig.update_layout(title=f"[모든 동+메뉴 합산] {tp} 전체 주문수 예측", xaxis_title="날짜", yaxis_title="주문수")
+    st.plotly_chart(fig, use_container_width=True)
+    st.write(f"**회귀식:** 주문수 = {model.coef_[0]:.3f} × 3일이동평균 + {model.coef_[1]:.3f} × 7일이동평균 + {model.intercept_:.3f}")
+    st.write(f"**설명력(R²):** {r2:.3f}")
